@@ -42,7 +42,6 @@ May 3, 2003 (Br'fin (Jeremy Parsons))
 	instead of abusing/overflowing shape_descriptors
 */
 
-#include "render.h"
 #include "shape_descriptors.h"
 
 /* ---------- constants */
