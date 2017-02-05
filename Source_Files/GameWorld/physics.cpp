@@ -281,16 +281,14 @@ void get_absolute_pitch_range(
 	*maximum= constants->maximum_elevation;
 }
 
-/* deltas of zero are ignored; all deltas must be in [-FIXED_ONE,FIXED_ONE] which will be scaled
-	to the maximum for that value */
 uint32 mask_in_absolute_positioning_information(
 	uint32 action_flags,
-	_fixed delta_yaw,
-	_fixed delta_pitch,
-	_fixed delta_position)
+	_fixed delta_yaw,      // Clamped to +/- FIXED_ONE/4, with units of FIXED_ONE = 90 deg
+	_fixed delta_pitch,    // Clamped to +/- FIXED_ONE/4, with units of FIXED_ONE = 22.5 deg
+	_fixed delta_position) // Clamped to [-FIXED_ONE/2, (0.5 - 2^-7)*FIXED_ONE] (max backward/forward step)
 {
 	struct physics_variables *variables= &local_player->variables;
-	short encoded_delta;
+	int32 encoded_delta;
 
 	if ((delta_yaw||variables->angular_velocity) && !(action_flags&_override_absolute_yaw))
 	{
@@ -302,12 +300,21 @@ uint32 mask_in_absolute_positioning_information(
 			sign_yaw = -1.0;
 			delta_yaw = -delta_yaw;
 		}
+		delta_yaw = MIN(delta_yaw, FIXED_ONE/4);
 		encoded_delta= sign_yaw*(delta_yaw>>(FIXED_FRACTIONAL_BITS-ABSOLUTE_YAW_BITS))+MAXIMUM_ABSOLUTE_YAW/2;
 		encoded_delta= PIN(encoded_delta, 0, MAXIMUM_ABSOLUTE_YAW-1);
 		action_flags= SET_ABSOLUTE_YAW(action_flags, encoded_delta)|_absolute_yaw_mode;
 	}
 
-	if ((delta_pitch||variables->vertical_angular_velocity) && !(action_flags&_override_absolute_pitch))
+	// Explicit and automatic recentering do not occur under absolute pitch mode; therefore we
+	// 1) try to always use absolute pitch mode if the user doesn't want auto-recentering; and
+	// 2) always avoid absolute pitch mode while an explicit recentering operation is in progress
+	// (pitch control is necessarily locked out until the recentering completes; no way to cancel)
+	
+	const bool explicitlyRecentering = variables->flags & _RECENTERING_BIT;
+	
+	if ((delta_pitch || variables->vertical_angular_velocity || dont_auto_recenter()) &&
+		!(action_flags & _override_absolute_pitch) && !explicitlyRecentering)
 	{
 		int sign_pitch = 1.0;
 		if (delta_pitch < 0)
@@ -315,6 +322,7 @@ uint32 mask_in_absolute_positioning_information(
 			sign_pitch = -1.0;
 			delta_pitch = -delta_pitch;
 		}
+		delta_pitch = MIN(delta_pitch, FIXED_ONE/4);
 		encoded_delta= sign_pitch*(delta_pitch>>(FIXED_FRACTIONAL_BITS-ABSOLUTE_PITCH_BITS))+MAXIMUM_ABSOLUTE_PITCH/2;
 		encoded_delta= PIN(encoded_delta, 0, MAXIMUM_ABSOLUTE_PITCH-1);
 		action_flags= SET_ABSOLUTE_PITCH(action_flags, encoded_delta)|_absolute_pitch_mode;
@@ -611,24 +619,21 @@ static void physics_update(
 		/* handle looking up and down; if weÕre moving at our terminal velocity forward or backward,
 			without any side-to-side motion, recenter our head vertically */
 
-        // ZZZ: only do auto-recentering if the user wants it
-        if(!PLAYER_DOESNT_AUTO_RECENTER(player)) {
-            if (!(action_flags&FLAGS_WHICH_PREVENT_RECENTERING)) /* canÕt recenter if any of these are true */
-		    {
-			    if (((action_flags&_moving_forward) && (variables->velocity==constants->maximum_forward_velocity)) ||
-				    ((action_flags&_moving_backward) && (variables->velocity==-constants->maximum_backward_velocity)))
-			    {
-				    if (variables->elevation<0)
-				    {
-					    variables->elevation= CEILING(variables->elevation+constants->angular_recentering_velocity, 0);
-				    }
-				    else
-				    {
-					    variables->elevation= FLOOR(variables->elevation-constants->angular_recentering_velocity, 0);
-				    }
-			    }
-		    }
-        }
+		if (!(action_flags&FLAGS_WHICH_PREVENT_RECENTERING)) /* canÕt recenter if any of these are true */
+		{
+			if (((action_flags&_moving_forward) && (variables->velocity==constants->maximum_forward_velocity)) ||
+				((action_flags&_moving_backward) && (variables->velocity==-constants->maximum_backward_velocity)))
+			{
+				if (variables->elevation<0)
+				{
+					variables->elevation= CEILING(variables->elevation+constants->angular_recentering_velocity, 0);
+				}
+				else
+				{
+					variables->elevation= FLOOR(variables->elevation-constants->angular_recentering_velocity, 0);
+				}
+			}
+		}
 
 		switch (action_flags&_looking_vertically)
 		{
