@@ -62,6 +62,7 @@ May 3, 2003 (Br'fin (Jeremy Parsons))
 
 #include <string.h>
 #include <limits.h>
+#include <algorithm>
 
 
 // LP: "recommended" sizes of stuff in growable lists
@@ -465,6 +466,122 @@ render_object_data *RenderPlaceObjsClass::build_render_object(
 	return render_object;
 }
 
+// Give a render object (and any parasites) a clipping window list aggregated from the windows of the nodes it crosses
+// - the assigned windows don't overlap or touch
+// - y clips aren't considered crucial and may be commonized (expanded only) to reduce window count
+// - for simplicity, aggregation is only accurate to integer pixels (the clip vectors may, rarely, be a tad off)
+void RenderPlaceObjsClass::build_aggregate_render_object_clipping_window(
+	render_object_data* render_object,
+	sorted_node_data** base_nodes,
+	short base_node_count)
+{
+	clipping_window_data* first_window = nullptr;
+	
+	if (base_node_count == 1)
+	{
+		// A single node's windows don't overlap, so we can use its window list as-is
+		first_window = base_nodes[0]->clipping_windows;
+	}
+	else
+	{
+		auto& ClippingWindows = RVPtr->ClippingWindows;
+		
+		constexpr int max_x_extents = 40;
+		struct x_extent { int32 window_index; int16 x0, x1; };
+		x_extent x_extents[max_x_extents];
+		int x_extent_count = 0;
+		int16 min_y0 = INT16_MAX;
+		int16 max_y1 = INT16_MIN;
+		long_vector2d min_y0_vec, max_y1_vec;
+		
+		// Collect the x extents and min/max y clips of all node clipping windows
+		for (int i = 0; i < base_node_count; ++i)
+		{
+			const auto* const head = base_nodes[i]->clipping_windows;
+			for (const auto* w = head; w && x_extent_count < max_x_extents; w = w->next_window)
+			{
+				x_extents[x_extent_count++] = {w - ClippingWindows.data(), w->x0, w->x1};
+				
+				if (w->y0 < min_y0) // not subpixel-precise
+				{
+					min_y0 = w->y0;
+					min_y0_vec = w->top;
+				}
+				
+				if (w->y1 > max_y1) // not subpixel-precise
+				{
+					max_y1 = w->y1;
+					max_y1_vec = w->bottom;
+				}
+			}
+		}
+		
+		// Sort the collected extents by x0, left to right (not subpixel-precise)
+		auto x_extent_is_left_of = [&](x_extent a, x_extent b){ return a.x0 < b.x0; };
+		std::sort(x_extents, x_extents + x_extent_count, x_extent_is_left_of);
+		
+		const auto initial_cw_ptr = ClippingWindows.data();
+		const int32 initial_cw_count = ClippingWindows.size();
+		
+		// Create an aggregate window for each sequence of connected (touching or overlapping) extent(s)
+		for (int left = 0; left < x_extent_count; )
+		{
+			// Search ahead for the next sequence and the rightmost-reaching extent in this one (not subpixel-precise)
+			int next = left + 1;
+			int right = left;
+			for (; next < x_extent_count && x_extents[next].x0 <= x_extents[right].x1; ++next)
+				right = x_extents[next].x1 > x_extents[right].x1 ? next : right;
+			
+			// Create the aggregate window for this sequence
+			clipping_window_data new_window;
+			new_window.left = ClippingWindows[x_extents[left].window_index].left;
+			new_window.right = ClippingWindows[x_extents[right].window_index].right;
+			new_window.top = min_y0_vec;
+			new_window.bottom = max_y1_vec;
+			new_window.x0 = x_extents[left].x0;
+			new_window.x1 = x_extents[right].x1;
+			new_window.y0 = min_y0;
+			new_window.y1 = max_y1;
+			new_window.next_window = nullptr; // we'll link up the windows after any reallocations
+			ClippingWindows.push_back(new_window);
+			
+			left = next;
+		}
+		
+		// Fix clipping window pointers invalidated by any reallocation of ClippingWindows
+		if (ClippingWindows.data() != initial_cw_ptr)
+		{
+			// Pointer arithmetic with invalid pointers is undefined, so we work with integers
+			const uintptr_t base0 = reinterpret_cast<uintptr_t>(initial_cw_ptr);
+			const uintptr_t base1 = reinterpret_cast<uintptr_t>(ClippingWindows.data());
+			auto rebase_old_ptr = [base0, base1](/*in,out*/ clipping_window_data*& ptr)
+			{
+				if (ptr)
+					ptr = reinterpret_cast<clipping_window_data*>(base1 + (reinterpret_cast<uintptr_t>(ptr) - base0));
+			};
+			
+			for (int32 i = 0; i < initial_cw_count; ++i)
+				rebase_old_ptr(ClippingWindows[i].next_window);
+			
+			for (auto& node : RSPtr->SortedNodes)
+				rebase_old_ptr(node.clipping_windows);
+			
+			for (auto& object : RenderObjects)
+				rebase_old_ptr(object.clipping_windows);
+		}
+		
+		// Link any new windows together
+		for (int32 i = initial_cw_count + 1; i < ClippingWindows.size(); ++i)
+			ClippingWindows[i-1].next_window = &ClippingWindows[i];
+		
+		if (ClippingWindows.size() > initial_cw_count)
+			first_window = &ClippingWindows[initial_cw_count];
+	}
+	
+	for (auto* r = render_object; r; r = r->next_object)
+		r->clipping_windows = first_window;
+}
+
 void RenderPlaceObjsClass::sort_render_object_into_tree(
 	render_object_data *new_render_object, /* null-terminated linked list */
 	sorted_node_data **base_nodes,
@@ -726,165 +843,6 @@ short RenderPlaceObjsClass::build_base_node_list(
 //	dprintf("found #%d polygons @ %p;dm %x %d;", base_polygon_count, base_polygon_indexes, base_polygon_indexes, base_polygon_count*sizeof(short));
 	
 	return base_node_count;
-}
-
-/* ---------- initializing and calculating clip data */
-
-/* find the lowest bottom clip and the highest top clip of all nodes this object crosses.  then
-	locate all left and right sides and compile them into one (or several) aggregate windows with
-	the same top and bottom */
-void RenderPlaceObjsClass::build_aggregate_render_object_clipping_window(
-	render_object_data *render_object,
-	sorted_node_data **base_nodes,
-	short base_node_count)
-{
-	clipping_window_data *first_window= NULL;
-	// LP: references to simplify the code
-	vector<clipping_window_data>& ClippingWindows = RVPtr->ClippingWindows;
-	vector<sorted_node_data>& SortedNodes = RSPtr->SortedNodes;
-	
-	if (base_node_count==1)
-	{
-		/* trivial case of one source window */
-		first_window= base_nodes[0]->clipping_windows;
-	}
-	else
-	{
-		short i;
-		short y0, y1;
-		short left, right, left_count, right_count;
-		short x0[MAXIMUM_OBJECT_BASE_NODES], x1[MAXIMUM_OBJECT_BASE_NODES]; /* sorted, left to right */
-		long_vector2d lvec[MAXIMUM_OBJECT_BASE_NODES], rvec[MAXIMUM_OBJECT_BASE_NODES];
-		clipping_window_data *window;
-		/* Make sure object depth fits in at least one clipping window */
-		int32 win_depth = SHRT_MAX;
-		for (i= 0; i<base_node_count; ++i)
-		{
-			window= base_nodes[i]->clipping_windows;
-			if (window)
-			{
-				win_depth = MIN(win_depth, ABS(window->left.i)+1);
-				win_depth = MIN(win_depth, ABS(window->right.i)+1);
-			}
-		}
-		int32 depth= MAX(render_object->rectangle.depth + view->screen_width, win_depth);
-		
-		/* find the upper and lower bounds of the windows; we could do a better job than this by
-			doing the same thing we do when the windows are originally built (i.e., calculating a
-			new top/bottom for every window.  but screw that.  */
-		left_count= right_count= 0;
-		y0= SHRT_MAX, y1= SHRT_MIN;
-		for (i= 0; i<base_node_count; ++i)
-		{
-			short j, k;
-			
-			window= base_nodes[i]->clipping_windows;
-
-			// CB: sometimes, the window pointer seems to be NULL
-			if (window == NULL)
-				continue;
-			
-			/* update the top and bottom clipping bounds */
-			if (window->y0<y0) y0= window->y0;
-			if (window->y1>y1) y1= window->y1;
- 			
-			/* sort in the left side of this window */
-			if (ABS(window->left.i)<depth)
-			{
-				for (j= 0; j<left_count && window->x0>=x0[j]; ++j)
-					;
-				for (k= j; k<left_count; ++k)
-				{
-					x0[k+1]= x0[k];
-					lvec[k+1]= lvec[k];
-				}
-				x0[j]= window->x0;
-				lvec[j]= window->left;
-				left_count+= 1;
-			}
-			
-			/* sort in the right side of this window */
-			if (ABS(window->right.i)<depth)
-			{
-				for (j= 0; j<right_count && window->x1>=x1[j]; ++j)
-					;
-				for (k= j; k<right_count; ++k)
-				{
-					x1[k+1]= x1[k];
-					rvec[k+1]= rvec[k];
-				}
-				x1[j]= window->x1;
-				rvec[j]= window->right;
-				right_count+= 1;
-			}
-		}
-		
-		/* build the windows, left to right */
-		for (left= 0, right= 0; left<left_count && right<right_count; )
-		{
-			if (left==left_count-1 || x0[left+1]>x1[right])
-			{
-				if (x0[left]<x1[right]) /* found one between x0[left] and x1[right] */
-				{
-					/* allocate it */
-					size_t Length = ClippingWindows.size();
-					POINTER_DATA OldCWPointer = POINTER_CAST(ClippingWindows.data());
-					
-					// Add a dummy object and check if the pointer got changed
-					clipping_window_data Dummy;
-					Dummy.next_window = NULL;			// Fake initialization to shut up CW
-					ClippingWindows.push_back(Dummy);
-					POINTER_DATA NewCWPointer = POINTER_CAST(ClippingWindows.data());
-				
-					if (NewCWPointer != OldCWPointer)
-					{
-						// Get the sorted nodes into sync
-						// Also, the render objects and the parent window
-						for (size_t k=0; k<Length; k++)
-						{
-							clipping_window_data &ClippingWindow = ClippingWindows[k];
-							if (ClippingWindow.next_window != NULL)
-								ClippingWindow.next_window = (clipping_window_data *)(NewCWPointer + (POINTER_CAST(ClippingWindow.next_window) - OldCWPointer));
-						}
-						for (size_t k=0; k<SortedNodes.size(); k++)
-						{
-							sorted_node_data &SortedNode = SortedNodes[k];
-							if (SortedNode.clipping_windows != NULL)
-								SortedNode.clipping_windows = (clipping_window_data *)(NewCWPointer + (POINTER_CAST(SortedNode.clipping_windows) - OldCWPointer));
-						}
-						for (unsigned k=0; k<RenderObjects.size(); k++)
-						{
-							render_object_data &RenderObject = RenderObjects[k];
-							if (RenderObject.clipping_windows != NULL)
-								RenderObject.clipping_windows = (clipping_window_data *)(NewCWPointer + (POINTER_CAST(RenderObject.clipping_windows) - OldCWPointer));
-						}
-						if (first_window != NULL)
-							first_window = (clipping_window_data *)(NewCWPointer + (POINTER_CAST(first_window) - OldCWPointer));
-					}
-					window= &ClippingWindows[Length];
-					
-					/* build it */
-					window->x0= x0[left], window->x1= x1[right];
-					window->left= lvec[left], window->right= rvec[right];
-					window->y0= y0, window->y1= y1;
-					
-					/* link it */
-					window->next_window= first_window;
-					first_window= window;
-				}
-				
-				/* advance left by one, then advance right until it’s greater than left */
-				if (++left<left_count) while (x0[left]>x1[right] && right<right_count) ++right;
-			}
-			else
-			{
-				left+= 1;
-			}
-		}
-	}
-	
-	/* stuff our windows in all objects hanging off our first object (i.e., all parasites) */	
-	for (; render_object; render_object= render_object->next_object) render_object->clipping_windows= first_window;
 }
 
 #define NUMBER_OF_SCALED_VALUES 6
